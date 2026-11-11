@@ -95,6 +95,28 @@ impl DesktopKeyboardRelay {
         Ok(())
     }
 
+    /// Send a release for keys that may have reached the desktop just before
+    /// Phantom grabbed their evdev device. This also repairs the grab race at
+    /// capture entry, when KDE saw a down but will not see its matching up.
+    pub fn release_keys(&mut self, keys: &HashSet<Key>) -> Result<()> {
+        for key in keys {
+            if !key.is_mouse() {
+                self.relay_key_event(*key, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Relay a key-up only when Phantom synthesized a matching desktop key-down
+    /// during capture exit. Ordinary non-captured keys stay on KDE's direct
+    /// physical-device path.
+    pub fn release_if_pressed(&mut self, key: Key) -> Result<()> {
+        if self.pressed_keys.contains(&key) {
+            self.relay_key_event(key, false)?;
+        }
+        Ok(())
+    }
+
     pub fn resync_pressed(&mut self, desired: &HashSet<Key>) -> Result<()> {
         let current: Vec<Key> = self.pressed_keys.iter().copied().collect();
         for key in current {

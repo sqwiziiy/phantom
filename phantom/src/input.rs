@@ -2467,6 +2467,15 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_is_observed_ungrabbed_outside_capture_and_grabbed_inside_it() {
+        assert!(!device_should_be_grabbed(true, false, false, false));
+        assert!(device_should_be_grabbed(true, false, true, false));
+        // Combo devices remain exclusive while either input class is captured.
+        assert!(device_should_be_grabbed(true, true, false, true));
+        assert!(!device_should_be_grabbed(true, true, false, false));
+    }
+
+    #[test]
     fn syn_dropped_keeps_device_desynced_when_resync_fails() {
         let file = File::open("/dev/null").unwrap();
         let fd = file.as_raw_fd();

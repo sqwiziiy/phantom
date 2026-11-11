@@ -134,10 +134,13 @@ Push Live from the GUI, then enter capture.
 
 They are independent on purpose.
 
-- **Daemon running** means the process is alive and holding the keyboard for
-  hotkeys. Capture can be off. Your desktop should still type, because Phantom
-  relays the keyboard through a virtual "Phantom Desktop Keyboard".
-- **Capture on** (`F8`) means gameplay input is owned. The mouse is grabbed.
+- **Daemon running** means the process observes evdev for runtime hotkeys.
+  While capture is off, the keyboard is not exclusively grabbed: physical key
+  events go directly to KDE and Phantom does not relay ordinary typing through
+  uinput. Hotkey presses are also visible to the desktop in this mode.
+- **Capture on** (`F8`) means gameplay input is owned. The keyboard and mouse
+  are grabbed; held keys are reconciled at the transition so key releases do
+  not stick in either destination.
   You start in **menu-touch**: left click is a finger, drag is a drag, wheel is
   a short swipe, and unused keys type into Android.
 - **Aim** (`F1`, while capture is on) means the owned mouse feeds the profile's

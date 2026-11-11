@@ -11,15 +11,25 @@ pub struct InputMetrics {
     syn_dropped: AtomicU64,
     route_count: AtomicU64,
     route_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+    queue_wait_count: AtomicU64,
+    queue_wait_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+    evdev_read_count: AtomicU64,
+    evdev_read_total_us: AtomicU64,
+    evdev_read_max_us: AtomicU64,
     backend_count: AtomicU64,
     backend_total_us: AtomicU64,
     backend_max_us: AtomicU64,
     backend_slow_200ms: AtomicU64,
+    android_socket_count: AtomicU64,
+    android_socket_total_us: AtomicU64,
+    android_socket_max_us: AtomicU64,
+    android_socket_slow_200ms: AtomicU64,
     relay_count: AtomicU64,
     relay_total_us: AtomicU64,
     relay_max_us: AtomicU64,
     drain_gap_max_us: AtomicU64,
     last_report: std::sync::Mutex<Instant>,
+    last_cpu_us: AtomicU64,
 }
 
 impl InputMetrics {
@@ -35,15 +45,25 @@ impl InputMetrics {
             syn_dropped: AtomicU64::new(0),
             route_count: AtomicU64::new(0),
             route_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+            queue_wait_count: AtomicU64::new(0),
+            queue_wait_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+            evdev_read_count: AtomicU64::new(0),
+            evdev_read_total_us: AtomicU64::new(0),
+            evdev_read_max_us: AtomicU64::new(0),
             backend_count: AtomicU64::new(0),
             backend_total_us: AtomicU64::new(0),
             backend_max_us: AtomicU64::new(0),
             backend_slow_200ms: AtomicU64::new(0),
+            android_socket_count: AtomicU64::new(0),
+            android_socket_total_us: AtomicU64::new(0),
+            android_socket_max_us: AtomicU64::new(0),
+            android_socket_slow_200ms: AtomicU64::new(0),
             relay_count: AtomicU64::new(0),
             relay_total_us: AtomicU64::new(0),
             relay_max_us: AtomicU64::new(0),
             drain_gap_max_us: AtomicU64::new(0),
             last_report: std::sync::Mutex::new(Instant::now()),
+            last_cpu_us: AtomicU64::new(process_cpu_us()),
         }
     }
 
@@ -79,6 +99,25 @@ impl InputMetrics {
         self.route_histogram[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_queue_wait(&self, latency: Duration, events: usize) {
+        if self.enabled && events > 0 {
+            self.queue_wait_count
+                .fetch_add(events as u64, Ordering::Relaxed);
+            self.queue_wait_histogram[latency_bucket(latency.as_micros() as u64)]
+                .fetch_add(events as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_evdev_read(&self, elapsed: Duration) {
+        if self.enabled {
+            let micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+            self.evdev_read_count.fetch_add(1, Ordering::Relaxed);
+            self.evdev_read_total_us
+                .fetch_add(micros, Ordering::Relaxed);
+            self.evdev_read_max_us.fetch_max(micros, Ordering::Relaxed);
+        }
+    }
+
     pub fn record_evdev_to_route_latency(&self, timestamp: (i64, i64)) {
         if !self.enabled {
             return;
@@ -107,6 +146,22 @@ impl InputMetrics {
         self.backend_max_us.fetch_max(micros, Ordering::Relaxed);
         if elapsed >= Duration::from_millis(200) {
             self.backend_slow_200ms.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_android_socket(&self, elapsed: Duration) {
+        if !self.enabled {
+            return;
+        }
+        let micros = elapsed.as_micros().min(u64::MAX as u128) as u64;
+        self.android_socket_count.fetch_add(1, Ordering::Relaxed);
+        self.android_socket_total_us
+            .fetch_add(micros, Ordering::Relaxed);
+        self.android_socket_max_us
+            .fetch_max(micros, Ordering::Relaxed);
+        if elapsed >= Duration::from_millis(200) {
+            self.android_socket_slow_200ms
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -139,20 +194,43 @@ impl InputMetrics {
         if last_report.elapsed() < REPORT_INTERVAL {
             return;
         }
+        let window = last_report.elapsed();
         *last_report = Instant::now();
 
         let count = self.route_count.swap(0, Ordering::Relaxed);
         let buckets: [u64; HISTOGRAM_BUCKETS] =
             std::array::from_fn(|idx| self.route_histogram[idx].swap(0, Ordering::Relaxed));
+        let queue_wait_count = self.queue_wait_count.swap(0, Ordering::Relaxed);
+        let queue_wait_buckets: [u64; HISTOGRAM_BUCKETS] =
+            std::array::from_fn(|idx| self.queue_wait_histogram[idx].swap(0, Ordering::Relaxed));
+        let evdev_read_calls = self.evdev_read_count.swap(0, Ordering::Relaxed);
+        let evdev_read_total_us = self.evdev_read_total_us.swap(0, Ordering::Relaxed);
         let backend_calls = self.backend_count.swap(0, Ordering::Relaxed);
         let backend_total_us = self.backend_total_us.swap(0, Ordering::Relaxed);
         let relay_calls = self.relay_count.swap(0, Ordering::Relaxed);
         let relay_total_us = self.relay_total_us.swap(0, Ordering::Relaxed);
+        let android_socket_calls = self.android_socket_count.swap(0, Ordering::Relaxed);
+        let android_socket_total_us = self.android_socket_total_us.swap(0, Ordering::Relaxed);
+        let cpu_us = process_cpu_us();
+        let previous_cpu_us = self.last_cpu_us.swap(cpu_us, Ordering::Relaxed);
+        let cpu_percent = if window.is_zero() {
+            0
+        } else {
+            ((cpu_us.saturating_sub(previous_cpu_us) as u128 * 100) / window.as_micros().max(1))
+                as u64
+        };
         tracing::info!(
             route_events = count,
             route_p50_us = percentile(&buckets, count, 50),
             route_p95_us = percentile(&buckets, count, 95),
             route_p99_us = percentile(&buckets, count, 99),
+            queue_wait_events = queue_wait_count,
+            queue_wait_p50_us = percentile(&queue_wait_buckets, queue_wait_count, 50),
+            queue_wait_p95_us = percentile(&queue_wait_buckets, queue_wait_count, 95),
+            queue_wait_p99_us = percentile(&queue_wait_buckets, queue_wait_count, 99),
+            evdev_read_calls,
+            evdev_read_avg_us = average(evdev_read_total_us, evdev_read_calls),
+            evdev_read_max_us = self.evdev_read_max_us.swap(0, Ordering::Relaxed),
             queue_depth_events = self.queue_events.load(Ordering::Relaxed),
             queue_high_water_events = self.queue_high_water.swap(0, Ordering::Relaxed),
             syn_dropped = self.syn_dropped.swap(0, Ordering::Relaxed),
@@ -161,12 +239,31 @@ impl InputMetrics {
             backend_avg_us = average(backend_total_us, backend_calls),
             backend_max_us = self.backend_max_us.swap(0, Ordering::Relaxed),
             backend_stalls_over_200ms = self.backend_slow_200ms.swap(0, Ordering::Relaxed),
+            android_socket_calls,
+            android_socket_avg_us = average(android_socket_total_us, android_socket_calls),
+            android_socket_max_us = self.android_socket_max_us.swap(0, Ordering::Relaxed),
+            android_socket_stalls_over_200ms =
+                self.android_socket_slow_200ms.swap(0, Ordering::Relaxed),
             desktop_relay_calls = relay_calls,
             desktop_relay_avg_us = average(relay_total_us, relay_calls),
             desktop_relay_max_us = self.relay_max_us.swap(0, Ordering::Relaxed),
+            process_cpu_percent = cpu_percent,
             "input latency metrics (5s window)"
         );
     }
+}
+
+fn process_cpu_us() -> u64 {
+    let mut cpu = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut cpu) } != 0 {
+        return 0;
+    }
+    (cpu.tv_sec.max(0) as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add((cpu.tv_nsec.max(0) as u64) / 1_000)
 }
 
 fn average(total_us: u64, count: u64) -> u64 {

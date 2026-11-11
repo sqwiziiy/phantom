@@ -774,21 +774,37 @@ pub async fn set_capture_active(state: &Arc<DaemonState>, active: bool) -> Resul
 
     let (pressed_keyboard, pressed_mouse) = {
         let mut capture = lock_capture(state)?;
-        // The daemon keeps the keyboard grabbed for its lifetime so runtime
-        // hotkeys stay reliable even when gameplay capture is not active.
-        capture.refresh_pressed_keys();
-        capture.set_grabbed_keyboard_only(true)?;
+        if active {
+            // Observe globally when capture is off. On entry, grab first, then
+            // query kernel state so a key pressed during the transition is
+            // included in the resync snapshot.
+            capture.set_grabbed_keyboard_only(true)?;
+            capture.refresh_pressed_keys();
+        } else {
+            // Snapshot keys while still exclusive. Once ungrabbed, KDE receives
+            // subsequent physical events directly; held keys are seeded below.
+            capture.refresh_pressed_keys();
+            capture.set_grabbed_keyboard_only(false)?;
+        }
         capture.set_grabbed_mouse_only(active)?;
+        // Publish ownership while the reader is excluded by this same capture
+        // mutex, so every subsequent batch receives the new routing generation.
+        state.capture_active.store(active, Ordering::Release);
+        state.routing_generation.fetch_add(1, Ordering::AcqRel);
         (
             capture.current_pressed_keyboard_keys(),
             capture.current_pressed_mouse_keys(),
         )
     };
+    if active {
+        // A hotkey or modifier down may have reached KDE just before EVIOCGRAB.
+        // Explicitly balance those host-side downs after taking ownership.
+        let mut relay = lock_desktop_keyboard(state)?;
+        relay.release_keys(&pressed_keyboard)?;
+    }
     if !active {
         apply_commands(state, &release_passthrough_keys(state)?)?;
     }
-    state.capture_active.store(active, Ordering::Release);
-    state.routing_generation.fetch_add(1, Ordering::AcqRel);
     if active {
         {
             let mut mouse_mode = lock_mouse_mode(state)?;
@@ -821,10 +837,8 @@ pub async fn set_capture_active(state: &Arc<DaemonState>, active: bool) -> Resul
             );
         }
     } else {
-        {
-            let mut relay = lock_desktop_keyboard(state)?;
-            relay.resync_pressed(&pressed_keyboard)?;
-        }
+        let mut relay = lock_desktop_keyboard(state)?;
+        relay.resync_pressed(&pressed_keyboard)?;
         stop_cursor_overlay(state)?;
     }
     Ok(())

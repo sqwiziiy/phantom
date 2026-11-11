@@ -158,13 +158,21 @@ Use:
 - `PHANTOM_INPUT_METRICS=1 phantom --daemon` for five-second aggregate input latency and stall measurements
 
 The detail flag exists because the raw evdev path is intentionally much noisier than normal trace logging.
-Input metrics are opt-in and report route p50/p95/p99, bounded input queue depth,
-maximum epoll drain gap, backend write duration and stalls over 200 ms, desktop
-relay write duration, and `SYN_DROPPED` counts. The daemon drains epoll on a
+Input metrics are opt-in and report evdev read duration, evdev-to-route and
+queue-wait p50/p95/p99, bounded input queue depth, maximum epoll drain gap,
+backend and Android Socket write duration (including stalls over 200 ms),
+desktop relay write duration, process CPU percentage, and `SYN_DROPPED` counts.
+The daemon drains epoll on a
 dedicated reader thread and passes ordered batches through a bounded queue;
 when the queue fills, the reader applies backpressure rather than dropping
 keyboard or touch-boundary events. Kernel evdev overflow still triggers the
 existing `SYN_DROPPED` state resynchronization path.
+
+When capture is off, evdev remains an observer for runtime hotkeys but the
+keyboard is not grabbed. KDE receives physical keyboard input directly without
+uinput relay. The configured hotkey key itself is also visible to KDE in this
+mode. Capture transitions grab or release keyboard devices, including combined
+keyboard/mouse devices, and reconcile held keys at the boundary.
 
 ## Aim Operations
 
@@ -174,7 +182,8 @@ Runtime note:
 
 - entering capture puts Phantom into owned menu-touch mode by default
 - `F1` switches between gameplay aim and owned menu-touch
-- leaving capture now replays currently held keys to the desktop
+- leaving capture seeds currently held captured keys into the desktop, then
+  physical key-up events return directly to KDE
 - it no longer destroys toggle-look state
 - `while_held` mouse buttons are resynced when mouse routing is turned back on
 - entering capture also re-establishes currently held keyboard-driven hold controls such as `tap`, `repeat_tap`, `joystick`, and hold-mode `layer_shift`
