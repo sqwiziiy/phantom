@@ -9,6 +9,7 @@ use phantom::desktop_relay::DesktopKeyboardRelay;
 use phantom::engine::KeymapEngine;
 use phantom::error::{PhantomError, Result};
 use phantom::input::{InputCapture, InputEvent};
+use phantom::input_metrics::InputMetrics;
 use phantom::ipc::{self, DaemonState, IpcRequest, MouseMode};
 use phantom::logging::trace_detail_enabled;
 use phantom::profile::Profile;
@@ -17,6 +18,14 @@ use phantom::touch;
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ENGINE_TICK_INTERVAL_MS: u64 = 4;
+const INPUT_QUEUE_BATCHES: usize = 128;
+const INPUT_BATCH_EVENTS: usize = 64;
+
+struct InputBatch {
+    events: Vec<InputEvent>,
+    event_timestamps: Vec<(i64, i64)>,
+    syn_dropped_count: usize,
+}
 
 fn print_help() {
     println!(
@@ -243,6 +252,10 @@ async fn run_daemon() -> Result<()> {
 
     let (state, mut shutdown_rx) =
         DaemonState::new(engine, touch, desktop_keyboard, capture, screen_w, screen_h);
+    let input_metrics = Arc::new(InputMetrics::from_environment());
+    if input_metrics.enabled() {
+        tracing::info!("input metrics enabled by PHANTOM_INPUT_METRICS");
+    }
     {
         let mut mouse_touch = ipc::lock_mouse_touch(&state)?;
         mouse_touch.apply_feel(
@@ -260,6 +273,96 @@ async fn run_daemon() -> Result<()> {
             tracing::error!("IPC server error: {}", e);
         }
     });
+
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<InputBatch>(INPUT_QUEUE_BATCHES);
+    let input_worker_stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = input_worker_stop.clone();
+    let worker_state = state.clone();
+    let worker_metrics = input_metrics.clone();
+    let input_worker = std::thread::Builder::new()
+        .name("phantom-evdev-reader".into())
+        .spawn(move || {
+            let mut last_drain = std::time::Instant::now();
+            while !worker_stop.load(Ordering::Acquire) {
+                let events = match ipc::lock_capture(&worker_state) {
+                    Ok(mut capture) => match capture.poll_events(10) {
+                        Ok(raw_events) => {
+                            let event_timestamps = raw_events
+                                .iter()
+                                .map(|(_, event)| (event.tv_sec, event.tv_usec))
+                                .collect();
+                            let syn_dropped_count = raw_events
+                                .iter()
+                                .filter(|(_, event)| event.type_ == 0 && event.code == 3)
+                                .count();
+                            let mut events = if raw_events.is_empty() {
+                                Vec::new()
+                            } else {
+                                capture.process_events(&raw_events)
+                            };
+                            events.extend(capture.flush_pending_touchpad_taps());
+                            Ok((events, event_timestamps, syn_dropped_count))
+                        }
+                        Err(err) => Err(err),
+                    },
+                    Err(err) => {
+                        tracing::warn!("input reader lock error: {}", err);
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+                worker_metrics.record_drain_gap(last_drain.elapsed());
+                last_drain = std::time::Instant::now();
+                let (events, event_timestamps, syn_dropped_count) = match events {
+                    Ok(events) => events,
+                    Err(err) => {
+                        tracing::warn!("input reader poll error: {}", err);
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+                if events.is_empty() && syn_dropped_count == 0 {
+                    continue;
+                }
+                if events.is_empty() {
+                    if input_tx
+                        .blocking_send(InputBatch {
+                            events,
+                            event_timestamps,
+                            syn_dropped_count,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                let chunk_count = events.len().div_ceil(INPUT_BATCH_EVENTS);
+                let mut event_chunks = events.chunks(INPUT_BATCH_EVENTS);
+                let timestamp_chunk_size = event_timestamps.len().div_ceil(chunk_count).max(1);
+                let mut timestamp_chunks = event_timestamps.chunks(timestamp_chunk_size);
+                for chunk_index in 0..chunk_count {
+                    let chunk = event_chunks.next().expect("chunk count matches events");
+                    let timestamps = timestamp_chunks
+                        .next()
+                        .map_or_else(Vec::new, |chunk| chunk.to_vec());
+                    worker_metrics.queue_add(chunk.len());
+                    let batch = InputBatch {
+                        events: chunk.to_vec(),
+                        event_timestamps: timestamps,
+                        syn_dropped_count: if chunk_index == 0 {
+                            syn_dropped_count
+                        } else {
+                            0
+                        },
+                    };
+                    if input_tx.blocking_send(batch).is_err() {
+                        worker_metrics.queue_remove(chunk.len());
+                        break;
+                    }
+                }
+            }
+        })?;
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let flag = shutdown_flag.clone();
@@ -286,8 +389,6 @@ async fn run_daemon() -> Result<()> {
         "daemon ready, entering event loop"
     );
 
-    let mut input_interval = tokio::time::interval(Duration::from_millis(1));
-    input_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // 4 ms is a better compromise for repeat-tap, drag, and macro timing than
     // the old frame-like 16 ms cadence, while still avoiding a 1 ms hot loop.
     let mut tick_interval = tokio::time::interval(Duration::from_millis(ENGINE_TICK_INTERVAL_MS));
@@ -306,39 +407,22 @@ async fn run_daemon() -> Result<()> {
                 tracing::info!("IPC shutdown command received");
                 break;
             }
-            _ = input_interval.tick() => {
-                let raw_events = match ipc::lock_capture(&state) {
-                    Ok(capture) => capture.poll_events(0),
-                    Err(e) => {
-                        tracing::warn!("input capture lock error: {}", e);
-                        continue;
-                    }
+            input_batch = input_rx.recv() => {
+                let Some(input_batch) = input_batch else {
+                    tracing::error!("input reader channel closed unexpectedly");
+                    break;
                 };
-
-                match raw_events {
-                    Ok(raw_events) => {
-                        let input_events = match ipc::lock_capture(&state) {
-                            Ok(mut capture) => {
-                                let mut events = if raw_events.is_empty() {
-                                    Vec::new()
-                                } else {
-                                    capture.process_events(&raw_events)
-                                };
-                                events.extend(capture.flush_pending_touchpad_taps());
-                                events
-                            }
-                            Err(e) => {
-                                tracing::warn!("input capture lock error: {}", e);
-                                continue;
-                            }
-                        };
-                        if input_events.is_empty() {
-                            continue;
-                        }
-                        let batch_generation = state.routing_generation.load(Ordering::Acquire);
-                        if !input_events.is_empty() {
-                            tracing::trace!(events = ?input_events, "translated input batch");
-                        }
+                input_metrics.queue_remove(input_batch.events.len());
+                for timestamp in &input_batch.event_timestamps {
+                    input_metrics.record_evdev_to_route_latency(*timestamp);
+                }
+                input_metrics.record_syn_dropped(input_batch.syn_dropped_count);
+                let input_events = input_batch.events;
+                if input_events.is_empty() {
+                    continue;
+                }
+                let batch_generation = state.routing_generation.load(Ordering::Acquire);
+                tracing::trace!(events = ?input_events, "translated input batch");
 
                         let mut gameplay_events = Vec::new();
                         let (mut mouse_mode, mut keyboard_routed) = match ipc::lock_capture(&state) {
@@ -394,7 +478,10 @@ async fn run_daemon() -> Result<()> {
                                             Vec::new()
                                         }
                                     };
-                                    if let Err(e) = ipc::apply_commands(&state, &mouse_touch_cmds) {
+                                    let backend_started = std::time::Instant::now();
+                                    let backend_result = ipc::apply_commands(&state, &mouse_touch_cmds);
+                                    input_metrics.record_backend(backend_started.elapsed());
+                                    if let Err(e) = backend_result {
                                         tracing::warn!("mouse-touch inject error: {}", e);
                                     }
                                     if trace_detail_enabled() && !mouse_touch_cmds.is_empty() {
@@ -418,9 +505,11 @@ async fn run_daemon() -> Result<()> {
                                 gameplay_events.push(event);
                             } else {
                                 if event.is_keyboard_input() {
+                                    let relay_started = std::time::Instant::now();
                                     if let Err(e) = ipc::relay_keyboard_event_to_desktop(&state, &event) {
                                         tracing::warn!("desktop keyboard relay error: {}", e);
                                     }
+                                    input_metrics.record_relay(relay_started.elapsed());
                                 }
                                 if trace_detail_enabled() {
                                     tracing::trace!(
@@ -463,19 +552,18 @@ async fn run_daemon() -> Result<()> {
                                 if cmds.is_empty() {
                                     continue;
                                 }
-                                if let Err(e) = dev.apply_commands(&cmds) {
+                                let backend_started = std::time::Instant::now();
+                                let backend_result = dev.apply_commands(&cmds);
+                                input_metrics.record_backend(backend_started.elapsed());
+                                if let Err(e) = backend_result {
                                     tracing::warn!("inject error: {}", e);
                                     break;
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::warn!("poll error: {}", e);
-                    }
-                }
             }
             _ = tick_interval.tick() => {
+                input_metrics.maybe_report();
                 if last_input_rescan.elapsed() >= Duration::from_secs(2) {
                     last_input_rescan = std::time::Instant::now();
                     if let Ok(mut capture) = ipc::lock_capture(&state) {
@@ -513,7 +601,10 @@ async fn run_daemon() -> Result<()> {
                             continue;
                         }
                     };
-                    if let Err(e) = dev.apply_commands(&cmds) {
+                    let backend_started = std::time::Instant::now();
+                    let backend_result = dev.apply_commands(&cmds);
+                    input_metrics.record_backend(backend_started.elapsed());
+                    if let Err(e) = backend_result {
                         tracing::warn!("inject error: {}", e);
                     }
                 }
@@ -522,6 +613,12 @@ async fn run_daemon() -> Result<()> {
     }
 
     tracing::info!("performing clean shutdown...");
+
+    input_worker_stop.store(true, Ordering::Release);
+    drop(input_rx);
+    if let Err(err) = input_worker.join() {
+        tracing::warn!("input reader thread did not stop cleanly: {:?}", err);
+    }
 
     {
         let mut engine = state.engine.write().await;
@@ -848,5 +945,99 @@ async fn main() {
     } else if let Err(e) = run_cli_command(&args).await {
         tracing::error!("{}", e);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod input_pipeline_tests {
+    use super::{InputBatch, INPUT_QUEUE_BATCHES};
+    use phantom::input::{InputEvent, Key, MouseMotionSource};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn batch(sequence: usize) -> InputBatch {
+        let event = match sequence % 3 {
+            0 => InputEvent::KeyPress(Key::A),
+            1 => InputEvent::MouseMove {
+                dx: (sequence / 3) as i32,
+                dy: -1,
+                source: MouseMotionSource::Relative,
+            },
+            _ => InputEvent::KeyRelease(Key::A),
+        };
+        InputBatch {
+            events: vec![event],
+            event_timestamps: Vec::new(),
+            syn_dropped_count: 0,
+        }
+    }
+
+    fn assert_event_matches_sequence(event: &InputEvent, sequence: usize) {
+        match (sequence % 3, event) {
+            (0, InputEvent::KeyPress(Key::A)) => {}
+            (1, InputEvent::MouseMove { dx, dy: -1, .. }) => {
+                assert_eq!(*dx, (sequence / 3) as i32);
+            }
+            (2, InputEvent::KeyRelease(Key::A)) => {}
+            (_, other) => panic!("unexpected event at sequence {sequence}: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_pipeline_preserves_synthetic_125_to_8000_hz_streams() {
+        for rate in [125, 500, 1_000, 8_000] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(INPUT_QUEUE_BATCHES);
+            let producer = std::thread::spawn(move || {
+                for sequence in 0..rate {
+                    tx.blocking_send(batch(sequence)).unwrap();
+                }
+            });
+
+            let mut received = 0;
+            while received < rate {
+                let input_batch = rx.recv().await.unwrap();
+                assert_eq!(input_batch.events.len(), 1);
+                assert_event_matches_sequence(&input_batch.events[0], received);
+                received += 1;
+            }
+            producer.join().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queue_backpressure_during_200_and_500_ms_backend_stalls_keeps_all_events() {
+        for stall in [Duration::from_millis(200), Duration::from_millis(500)] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(INPUT_QUEUE_BATCHES);
+            let producer = std::thread::spawn(move || {
+                for sequence in 0..(INPUT_QUEUE_BATCHES * 2) {
+                    tx.blocking_send(batch(sequence)).unwrap();
+                }
+            });
+
+            tokio::time::sleep(stall).await;
+            for sequence in 0..(INPUT_QUEUE_BATCHES * 2) {
+                let input_batch = rx.recv().await.unwrap();
+                assert_event_matches_sequence(&input_batch.events[0], sequence);
+            }
+            producer.join().unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_receiver_unblocks_reader_for_graceful_shutdown() {
+        let (tx, rx) = tokio::sync::mpsc::channel(INPUT_QUEUE_BATCHES);
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stopped = stopped.clone();
+        let reader = std::thread::spawn(move || {
+            for sequence in 0..usize::MAX {
+                if tx.blocking_send(batch(sequence)).is_err() {
+                    break;
+                }
+            }
+            worker_stopped.store(true, std::sync::atomic::Ordering::Release);
+        });
+        drop(rx);
+        reader.join().unwrap();
+        assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
     }
 }

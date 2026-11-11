@@ -1306,15 +1306,20 @@ impl InputCapture {
             }
         }
 
-        let mut events = Vec::new();
-        for key in pressed_now.difference(&device.pressed_keys) {
-            events.push(InputEvent::KeyPress(*key));
-        }
-        for key in device.pressed_keys.difference(&pressed_now) {
-            events.push(InputEvent::KeyRelease(*key));
-        }
+        let events = Self::key_state_transitions(&device.pressed_keys, &pressed_now);
         device.pressed_keys = pressed_now;
         Ok(events)
+    }
+
+    fn key_state_transitions(previous: &HashSet<Key>, current: &HashSet<Key>) -> Vec<InputEvent> {
+        let mut events = Vec::new();
+        for key in current.difference(previous) {
+            events.push(InputEvent::KeyPress(*key));
+        }
+        for key in previous.difference(current) {
+            events.push(InputEvent::KeyRelease(*key));
+        }
+        events
     }
 
     fn flush_absolute_pointer_motion(device: &mut DeviceInfo) -> Vec<InputEvent> {
@@ -1703,6 +1708,22 @@ fn eviocgabs_request(axis: u16) -> libc::c_ulong {
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+
+    #[test]
+    fn key_resync_releases_lost_keys_and_does_not_repeat_held_keys() {
+        let previous = HashSet::from([Key::W, Key::A]);
+        let current = HashSet::from([Key::W, Key::D]);
+        let transitions = InputCapture::key_state_transitions(&previous, &current);
+
+        assert_eq!(transitions.len(), 2);
+        assert!(transitions
+            .iter()
+            .any(|event| matches!(event, InputEvent::KeyRelease(Key::A))));
+        assert!(transitions
+            .iter()
+            .any(|event| matches!(event, InputEvent::KeyPress(Key::D))));
+        assert!(InputCapture::key_state_transitions(&current, &current).is_empty());
+    }
 
     #[test]
     fn android_keycode_maps_letters_and_withholds_system_keys() {

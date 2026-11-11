@@ -116,6 +116,9 @@ sudo -E phantom --daemon
 
 Add `--trace` when you need lifecycle logs. Use
 `PHANTOM_TRACE_DETAIL=1` only when you are chasing raw evdev bugs.
+Set `PHANTOM_INPUT_METRICS=1` to log five-second aggregate input latency,
+backend-write, desktop-relay, queue-depth, epoll-drain, and `SYN_DROPPED`
+measurements without per-event logging.
 
 4. In a normal user shell:
 

@@ -155,8 +155,16 @@ Use:
 - `phantom --daemon` for normal operation
 - `phantom --trace --daemon` for useful runtime diagnosis
 - `PHANTOM_TRACE_DETAIL=1 phantom --trace --daemon` only for raw input/device forensics
+- `PHANTOM_INPUT_METRICS=1 phantom --daemon` for five-second aggregate input latency and stall measurements
 
 The detail flag exists because the raw evdev path is intentionally much noisier than normal trace logging.
+Input metrics are opt-in and report route p50/p95/p99, bounded input queue depth,
+maximum epoll drain gap, backend write duration and stalls over 200 ms, desktop
+relay write duration, and `SYN_DROPPED` counts. The daemon drains epoll on a
+dedicated reader thread and passes ordered batches through a bounded queue;
+when the queue fills, the reader applies backpressure rather than dropping
+keyboard or touch-boundary events. Kernel evdev overflow still triggers the
+existing `SYN_DROPPED` state resynchronization path.
 
 ## Aim Operations
 

@@ -27,11 +27,15 @@ That leads to four architectural decisions:
 ```text
 Host Linux
 ─────────────────────────────────────────────────────────────────────
- physical keyboard/mouse
+physical keyboard/mouse
           │
           ▼
   evdev capture
   phantom/src/input.rs
+          │
+          ▼
+  dedicated reader thread
+  bounded ordered event batches
           │
           ▼
   InputEvent stream
@@ -89,6 +93,16 @@ Responsibilities:
 - translate them into Phantom `InputEvent`s
 - maintain runtime grab state for keyboard and mouse independently
 - recover key/button state after `SYN_DROPPED`
+
+The daemon's `phantom-evdev-reader` thread polls and translates input
+independently from synchronous Android backend writes. It forwards translated
+events through a bounded channel (128 batches, at most 64 events per batch),
+preserving each device's event and report order. Backpressure blocks the reader
+instead of discarding key transitions; if the kernel buffer overflows, normal
+`SYN_DROPPED` resynchronization reconciles held keys. A shared capture mutex
+serializes reading, hotplug, grab changes, and state refreshes. Set
+`PHANTOM_INPUT_METRICS=1` for aggregate input, backend, relay, queue, and
+resynchronization measurements.
 
 Why it matters:
 

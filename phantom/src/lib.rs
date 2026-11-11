@@ -7,6 +7,7 @@ pub mod hyprland_cursor;
 pub mod hyprland_ipc;
 pub mod inject;
 pub mod input;
+pub mod input_metrics;
 pub mod ipc;
 pub mod logging;
 pub mod mouse_touch;
