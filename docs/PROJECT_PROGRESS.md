@@ -3,14 +3,15 @@
 ## Current snapshot
 
 - Task: implement phase 1 from `CODEX_TASK_RU.md` on `fix/input-latency-kde-coordinates` at base `v1.1.0`.
-- Status: phase 1 implementation and automated verification are complete. Physical KDE/Waydroid validation and measured before/after latency remain outstanding.
+- Status: phase 1 implementation is committed and automated verification is complete. Physical KDE/Waydroid validation and measured before/after latency remain outstanding.
 - Worktree initially contained the user-provided untracked `CODEX_TASK_RU.md` and `TEST_MATRIX.md`; preserve both.
 - Initial runtime finding: the Tokio daemon loop polls and routes evdev events and performs synchronous backend writes. `InputCapture` is guarded by a mutex shared by the loop and IPC transitions. `SYN_DROPPED` resync handling already exists in `phantom/src/input.rs`.
 - Implemented: dedicated `phantom-evdev-reader` thread polls, translates, and flushes input; bounded Tokio channel uses at most 128 batches of 64 events each, preserving order under backpressure. `InputCapture` is shared under one mutex, serializing reader state with IPC grab/hotplug controls.
 - Implemented: opt-in `PHANTOM_INPUT_METRICS=1` measurements for evdev timestamp-to-routing p50/p95/p99, backend and relay write durations, queue depth/high-water, epoll drain gap, and `SYN_DROPPED` counts.
 - Implemented: tests for 125/500/1000/8000 event streams, keyboard/mouse ordering, 200/500 ms bounded-queue stalls, reader shutdown, resync transitions and latency histogram percentiles.
 - Validation so far: `cargo check --workspace --offline` passed; first `cargo test --workspace --offline` passed (110 library tests, 3 daemon tests, 29 integration tests; 4 ignored). A resync transition test was added after that run and still needs a final rerun.
-- Next action: inspect the final diff, record the exact changed files, and commit the phase 1 implementation.
+- Commit: `a83aee4` (`perf: decouple evdev capture from backend writes`).
+- Next action: run target-system acceptance tests when KDE Wayland and Waydroid are available; capture before/after latency percentiles and confirm desktop keyboard relay behavior.
 - Physical KDE/Waydroid latency measurements are not available from this environment and must not be claimed.
 
 ## Evidence log
@@ -39,4 +40,5 @@
 - `git diff --check`: passed.
 - The 200/500 ms tests simulate a stalled bounded-channel consumer; they do not exercise a live Android TCP socket. No physical KDE/Waydroid performance run was available, so no before/after latency claim is made.
 - Remaining limitation: capture controls and hotplug share the capture mutex with the reader; they serialize safely but are not routed through a dedicated control-message owner. Physical typing and Waydroid behavior still need acceptance testing on the target system.
-- Next action: inspect the final diff, record the exact changed files, and commit the phase 1 implementation.
+- Commit created: `a83aee4` (`perf: decouple evdev capture from backend writes`).
+- Next action: run target-system acceptance tests when KDE Wayland and Waydroid are available; capture before/after latency percentiles and confirm desktop keyboard relay behavior.
