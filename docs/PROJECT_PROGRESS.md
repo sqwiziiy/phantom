@@ -17,6 +17,7 @@
 - Regression test simulates 200/500 ms output stalls and records ordered final sink delivery latency for interleaved keyboard/mouse streams. This is a deterministic mock queue test, not a live Android Socket or KDE measurement.
 - Next action: run target-system acceptance and record physical before/after latency when KDE Wayland and Waydroid are available.
 - Physical KDE/Waydroid latency measurements are not available from this environment and must not be claimed.
+- Current follow-up: Stage A Android output decoupling is implemented in the worktree and passed the first offline clippy/test run. Stage B KDE KWin geometry integration and its commit are still pending.
 
 ## Evidence log
 
@@ -58,3 +59,13 @@
 - Physical KDE+Waydroid typing latency and a live installed Phantom 1.1.0 comparison are not available in this environment.
 - Source-only comparison against `v1.1.0` confirms its startup also grabs the keyboard for runtime hotkeys and relays non-capture keyboard events through uinput. No live comparison against the installed package was performed.
 - Phase 1 regression fix committed to `fix/input-latency-kde-coordinates`; target-system validation remains the next action.
+
+### 2026-11-11 — active capture output worker (Stage A)
+
+- Reproduced the blocking architecture by tracing engine output: `main.rs` synchronously called `TouchDevice::apply_commands`, which writes/flushes each Android Socket protocol frame before the event loop can route more input.
+- Added a dedicated `phantom-android-output` worker with one bounded FIFO queue for all touch and Android key commands. All regular event routing enqueues without waiting for socket completion; IPC/capture mode transitions use a synchronous completion barrier on the same queue to preserve order.
+- On backend errors, the worker makes a best-effort release of tracked Android keys and calls `release_all()` for active contacts. Bounded queue fullness applies backpressure without dropping transitions.
+- Added physical evdev timestamp-to-send, output queue wait/depth/high-water, backend duration, and Android Socket duration measurements. Updated architecture and operations documentation.
+- Added deterministic worker delivery tests for 100/200/500 ms backend delays with interleaved touch and keyboard commands, and daemon pipeline tests for 200/500 ms stalls and bounded queue backpressure. Assertions observe final mock sink delivery and exact command order, not only reader speed.
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, and `cargo test --workspace --offline` passed. Counts: 113 library tests, 4 daemon tests, 29 integration tests passed; 4 ignored.
+- Physical F8/F1/WASD/mouse acceptance and live Android Socket latency are not measured here. The tests use deterministic mock backends. Stage A still requires release build and final checks before commit.

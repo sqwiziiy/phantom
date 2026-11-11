@@ -8,7 +8,7 @@ use phantom::config;
 use phantom::desktop_relay::DesktopKeyboardRelay;
 use phantom::engine::KeymapEngine;
 use phantom::error::{PhantomError, Result};
-use phantom::input::{InputCapture, InputEvent};
+use phantom::input::{InputCapture, InputEvent, RawInputEvent};
 use phantom::input_metrics::InputMetrics;
 use phantom::ipc::{self, DaemonState, IpcRequest, MouseMode};
 use phantom::logging::trace_detail_enabled;
@@ -22,11 +22,126 @@ const INPUT_QUEUE_BATCHES: usize = 128;
 const INPUT_BATCH_EVENTS: usize = 64;
 
 struct InputBatch {
-    events: Vec<InputEvent>,
-    event_timestamps: Vec<(i64, i64)>,
+    events: Vec<TimedInputEvent>,
     syn_dropped_count: usize,
     queued_at: std::time::Instant,
     routing_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct TimedInputEvent {
+    event: InputEvent,
+    event_at: std::time::Instant,
+}
+
+fn monotonic_now_us() -> i64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return 0;
+    }
+    now.tv_sec
+        .saturating_mul(1_000_000)
+        .saturating_add(now.tv_nsec / 1_000)
+}
+
+fn raw_event_instant(
+    raw: &RawInputEvent,
+    observed_at: std::time::Instant,
+    monotonic_now_us: i64,
+) -> std::time::Instant {
+    let event_us = raw
+        .tv_sec
+        .saturating_mul(1_000_000)
+        .saturating_add(raw.tv_usec);
+    let age_us = monotonic_now_us.saturating_sub(event_us).max(0) as u64;
+    observed_at
+        .checked_sub(Duration::from_micros(age_us))
+        .unwrap_or(observed_at)
+}
+
+fn raw_timestamp_for_input(
+    input: &InputEvent,
+    raw_events: &[(libc::c_int, RawInputEvent)],
+    cursor: &mut usize,
+    observed_at: std::time::Instant,
+    monotonic_now_us: i64,
+) -> std::time::Instant {
+    const EV_SYN: u16 = 0;
+    const EV_KEY: u16 = 1;
+    const EV_REL: u16 = 2;
+    const EV_ABS: u16 = 3;
+    const SYN_REPORT: u16 = 0;
+    const BTN_TOUCH: u16 = 0x14a;
+
+    let matched = match input {
+        InputEvent::KeyPress(key) | InputEvent::KeyRelease(key) => {
+            key.evdev_code().and_then(|code| {
+                let value = if matches!(input, InputEvent::KeyPress(_)) {
+                    1
+                } else {
+                    0
+                };
+                raw_events
+                    .iter()
+                    .enumerate()
+                    .skip(*cursor)
+                    .find(|(_, (_, raw))| {
+                        raw.type_ == EV_KEY && raw.code == code && raw.value == value
+                    })
+                    .map(|(index, _)| index)
+            })
+        }
+        InputEvent::PointerContactStart { .. } | InputEvent::PointerContactEnd { .. } => {
+            let value = if matches!(input, InputEvent::PointerContactStart { .. }) {
+                1
+            } else {
+                0
+            };
+            raw_events
+                .iter()
+                .enumerate()
+                .skip(*cursor)
+                .find(|(_, (_, raw))| {
+                    raw.type_ == EV_KEY && raw.code == BTN_TOUCH && raw.value == value
+                })
+                .map(|(index, _)| index)
+        }
+        InputEvent::MouseMove { .. } => raw_events
+            .iter()
+            .enumerate()
+            .skip(*cursor)
+            .find(|(report_index, (fd, raw))| {
+                if raw.type_ != EV_SYN || raw.code != SYN_REPORT {
+                    return false;
+                }
+                let previous_report = raw_events[..*report_index]
+                    .iter()
+                    .rposition(|(other_fd, event)| {
+                        *other_fd == *fd && event.type_ == EV_SYN && event.code == SYN_REPORT
+                    })
+                    .map_or(0, |index| index + 1);
+                raw_events[previous_report..*report_index]
+                    .iter()
+                    .any(|(other_fd, event)| {
+                        *other_fd == *fd
+                            && ((event.type_ == EV_REL && (event.code == 0 || event.code == 1))
+                                || (event.type_ == EV_ABS && (event.code == 0 || event.code == 1)))
+                    })
+            })
+            .map(|(index, _)| index),
+    };
+
+    let fallback = (*cursor).min(raw_events.len().saturating_sub(1));
+    let index = matched.unwrap_or(fallback);
+    if !raw_events.is_empty() {
+        *cursor = index.saturating_add(1);
+        raw_event_instant(&raw_events[index].1, observed_at, monotonic_now_us)
+    } else {
+        observed_at
+    }
 }
 
 fn print_help() {
@@ -257,6 +372,7 @@ async fn run_daemon() -> Result<()> {
     let (state, mut shutdown_rx) =
         DaemonState::new(engine, touch, desktop_keyboard, capture, screen_w, screen_h);
     let input_metrics = Arc::new(InputMetrics::from_environment());
+    let touch_output_worker = ipc::start_touch_output_worker(&state, input_metrics.clone())?;
     if input_metrics.enabled() {
         tracing::info!("input metrics enabled by PHANTOM_INPUT_METRICS");
     }
@@ -295,26 +411,40 @@ async fn run_daemon() -> Result<()> {
                             worker_state.routing_generation.load(Ordering::Acquire);
                         match capture.poll_events(10) {
                             Ok(raw_events) => {
-                                let event_timestamps = raw_events
-                                    .iter()
-                                    .map(|(_, event)| (event.tv_sec, event.tv_usec))
-                                    .collect();
                                 let syn_dropped_count = raw_events
                                     .iter()
                                     .filter(|(_, event)| event.type_ == 0 && event.code == 3)
                                     .count();
-                                let mut events = if raw_events.is_empty() {
+                                let translated = if raw_events.is_empty() {
                                     Vec::new()
                                 } else {
                                     capture.process_events(&raw_events)
                                 };
-                                events.extend(capture.flush_pending_touchpad_taps());
-                                Ok((
-                                    events,
-                                    event_timestamps,
-                                    syn_dropped_count,
-                                    routing_generation,
-                                ))
+                                let observed_at = std::time::Instant::now();
+                                let monotonic_now_us = monotonic_now_us();
+                                let mut raw_cursor = 0;
+                                let mut events = translated
+                                    .into_iter()
+                                    .map(|event| {
+                                        let event_at = raw_timestamp_for_input(
+                                            &event,
+                                            &raw_events,
+                                            &mut raw_cursor,
+                                            observed_at,
+                                            monotonic_now_us,
+                                        );
+                                        TimedInputEvent { event, event_at }
+                                    })
+                                    .collect::<Vec<_>>();
+                                events.extend(
+                                    capture.flush_pending_touchpad_taps().into_iter().map(
+                                        |event| TimedInputEvent {
+                                            event,
+                                            event_at: std::time::Instant::now(),
+                                        },
+                                    ),
+                                );
+                                Ok((events, syn_dropped_count, routing_generation))
                             }
                             Err(err) => Err(err),
                         }
@@ -328,8 +458,7 @@ async fn run_daemon() -> Result<()> {
                 worker_metrics.record_evdev_read(read_started.elapsed());
                 worker_metrics.record_drain_gap(last_drain.elapsed());
                 last_drain = std::time::Instant::now();
-                let (events, event_timestamps, syn_dropped_count, routing_generation) = match events
-                {
+                let (events, syn_dropped_count, routing_generation) = match events {
                     Ok(events) => events,
                     Err(err) => {
                         tracing::warn!("input reader poll error: {}", err);
@@ -344,7 +473,6 @@ async fn run_daemon() -> Result<()> {
                     if input_tx
                         .blocking_send(InputBatch {
                             events,
-                            event_timestamps,
                             syn_dropped_count,
                             queued_at: std::time::Instant::now(),
                             routing_generation,
@@ -357,17 +485,11 @@ async fn run_daemon() -> Result<()> {
                 }
                 let chunk_count = events.len().div_ceil(INPUT_BATCH_EVENTS);
                 let mut event_chunks = events.chunks(INPUT_BATCH_EVENTS);
-                let timestamp_chunk_size = event_timestamps.len().div_ceil(chunk_count).max(1);
-                let mut timestamp_chunks = event_timestamps.chunks(timestamp_chunk_size);
                 for chunk_index in 0..chunk_count {
                     let chunk = event_chunks.next().expect("chunk count matches events");
-                    let timestamps = timestamp_chunks
-                        .next()
-                        .map_or_else(Vec::new, |chunk| chunk.to_vec());
                     worker_metrics.queue_add(chunk.len());
                     let batch = InputBatch {
                         events: chunk.to_vec(),
-                        event_timestamps: timestamps,
                         syn_dropped_count: if chunk_index == 0 {
                             syn_dropped_count
                         } else {
@@ -437,11 +559,11 @@ async fn run_daemon() -> Result<()> {
                     input_batch.queued_at.elapsed(),
                     input_batch.events.len(),
                 );
-                for timestamp in &input_batch.event_timestamps {
-                    input_metrics.record_evdev_to_route_latency(*timestamp);
-                }
                 input_metrics.record_syn_dropped(input_batch.syn_dropped_count);
                 let input_events = input_batch.events;
+                for event in &input_events {
+                    input_metrics.record_route_latency(event.event_at.elapsed());
+                }
                 if input_events.is_empty() {
                     continue;
                 }
@@ -469,8 +591,9 @@ async fn run_daemon() -> Result<()> {
                                 continue;
                             }
                         };
-                        for event in input_events {
-                            match handle_runtime_shortcut(&state, &event, &runtime_hotkeys).await {
+                        for timed_event in input_events {
+                            let event = &timed_event.event;
+                            match handle_runtime_shortcut(&state, event, &runtime_hotkeys).await {
                                 Ok(true) => {
                                     match ipc::lock_capture(&state) {
                                         Ok(capture) => {
@@ -498,33 +621,18 @@ async fn run_daemon() -> Result<()> {
                             }
                             if state.capture_active.load(Ordering::Acquire) {
                                 if event.is_mouse_input() && matches!(mouse_mode, MouseMode::MenuTouch) {
-                                    let mouse_touch_cmds = match ipc::process_menu_touch_event(&state, &event) {
+                                    let mouse_touch_cmds = match ipc::process_menu_touch_event(&state, event) {
                                         Ok(cmds) => cmds,
                                         Err(e) => {
                                             tracing::warn!("mouse-touch processing error: {}", e);
                                             Vec::new()
                                         }
                                     };
-                                    let backend_started = std::time::Instant::now();
-                                    let backend_result = if mouse_touch_cmds.is_empty() {
-                                        Ok(())
-                                    } else {
-                                        let mut dev = match ipc::lock_touch_device(&state) {
-                                            Ok(dev) => dev,
-                                            Err(e) => {
-                                                tracing::warn!("touch backend lock error: {}", e);
-                                                continue;
-                                            }
-                                        };
-                                        let is_android_socket = dev.backend_name() == "android_socket";
-                                        let result = dev.apply_commands(&mouse_touch_cmds);
-                                        if is_android_socket {
-                                            input_metrics.record_android_socket(backend_started.elapsed());
-                                        }
-                                        result
-                                    };
-                                    input_metrics.record_backend(backend_started.elapsed());
-                                    if let Err(e) = backend_result {
+                                    if let Err(e) = ipc::queue_touch_commands_since(
+                                        &state,
+                                        &mouse_touch_cmds,
+                                        timed_event.event_at,
+                                    ) {
                                         tracing::warn!("mouse-touch inject error: {}", e);
                                     }
                                     if trace_detail_enabled() && !mouse_touch_cmds.is_empty() {
@@ -545,7 +653,7 @@ async fn run_daemon() -> Result<()> {
                                     }
                                     continue;
                                 }
-                                gameplay_events.push(event);
+                                gameplay_events.push(timed_event);
                             } else {
                                 if let InputEvent::KeyRelease(key) = &event {
                                     let relay_started = std::time::Instant::now();
@@ -571,14 +679,8 @@ async fn run_daemon() -> Result<()> {
                         if !gameplay_events.is_empty() {
                             tracing::trace!(events = ?gameplay_events, "forwarding gameplay events to engine");
                             let mut engine = state.engine.write().await;
-                            let mut dev = match ipc::lock_touch_device(&state) {
-                                Ok(dev) => dev,
-                                Err(e) => {
-                                    tracing::warn!("touch backend lock error: {}", e);
-                                    continue;
-                                }
-                            };
-                            for event in &gameplay_events {
+                        for timed_event in &gameplay_events {
+                            let event = &timed_event.event;
                                 if state.routing_generation.load(Ordering::Acquire) != batch_generation {
                                     break;
                                 }
@@ -597,16 +699,12 @@ async fn run_daemon() -> Result<()> {
                                 if cmds.is_empty() {
                                     continue;
                                 }
-                                let backend_started = std::time::Instant::now();
-                                let is_android_socket = dev.backend_name() == "android_socket";
-                                let backend_result = dev.apply_commands(&cmds);
-                                let elapsed = backend_started.elapsed();
-                                input_metrics.record_backend(elapsed);
-                                if is_android_socket {
-                                    input_metrics.record_android_socket(elapsed);
-                                }
-                                if let Err(e) = backend_result {
-                                    tracing::warn!("inject error: {}", e);
+                                if let Err(e) = ipc::queue_touch_commands_since(
+                                    &state,
+                                    &cmds,
+                                    timed_event.event_at,
+                                ) {
+                                    tracing::warn!("touch output queue error: {}", e);
                                     break;
                                 }
                             }
@@ -644,22 +742,7 @@ async fn run_daemon() -> Result<()> {
                     Err(e) => tracing::warn!("passthrough tick error: {}", e),
                 }
                 if !cmds.is_empty() {
-                    let mut dev = match ipc::lock_touch_device(&state) {
-                        Ok(dev) => dev,
-                        Err(e) => {
-                            tracing::warn!("touch backend lock error: {}", e);
-                            continue;
-                        }
-                    };
-                    let backend_started = std::time::Instant::now();
-                    let is_android_socket = dev.backend_name() == "android_socket";
-                    let backend_result = dev.apply_commands(&cmds);
-                    let elapsed = backend_started.elapsed();
-                    input_metrics.record_backend(elapsed);
-                    if is_android_socket {
-                        input_metrics.record_android_socket(elapsed);
-                    }
-                    if let Err(e) = backend_result {
+                    if let Err(e) = ipc::queue_touch_commands(&state, &cmds) {
                         tracing::warn!("inject error: {}", e);
                     }
                 }
@@ -679,10 +762,9 @@ async fn run_daemon() -> Result<()> {
         let mut engine = state.engine.write().await;
         let cmds = engine.release_all();
         drop(engine);
-        let mut dev = ipc::lock_touch_device(&state)?;
-        let _ = dev.apply_commands(&cmds);
+        let _ = ipc::apply_commands(&state, &cmds);
         if let Ok(passthrough) = ipc::release_passthrough_keys(&state) {
-            let _ = dev.apply_commands(&passthrough);
+            let _ = ipc::apply_commands(&state, &passthrough);
         }
     }
 
@@ -706,11 +788,13 @@ async fn run_daemon() -> Result<()> {
         if let Ok(mut mouse_touch) = ipc::lock_mouse_touch(&state) {
             let cmds = mouse_touch.suspend();
             if !cmds.is_empty() {
-                if let Ok(mut dev) = ipc::lock_touch_device(&state) {
-                    let _ = dev.apply_commands(&cmds);
-                }
+                let _ = ipc::queue_touch_commands(&state, &cmds);
             }
         }
+    }
+
+    if let Err(err) = ipc::stop_touch_output_worker(&state, touch_output_worker) {
+        tracing::warn!("touch output worker shutdown failed: {}", err);
     }
 
     {
@@ -760,8 +844,7 @@ async fn handle_runtime_shortcut(
                 }
             };
             if !cmds.is_empty() {
-                let mut dev = ipc::lock_touch_device(state)?;
-                let _ = dev.apply_commands(&cmds);
+                ipc::queue_touch_commands(state, &cmds)?;
             }
             Ok(true)
         }
@@ -1005,7 +1088,7 @@ async fn main() {
 
 #[cfg(test)]
 mod input_pipeline_tests {
-    use super::{InputBatch, INPUT_QUEUE_BATCHES};
+    use super::{InputBatch, TimedInputEvent, INPUT_QUEUE_BATCHES};
     use phantom::input::{InputEvent, Key, MouseMotionSource};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1021,8 +1104,10 @@ mod input_pipeline_tests {
             _ => InputEvent::KeyRelease(Key::A),
         };
         InputBatch {
-            events: vec![event],
-            event_timestamps: Vec::new(),
+            events: vec![TimedInputEvent {
+                event,
+                event_at: std::time::Instant::now(),
+            }],
             syn_dropped_count: 0,
             queued_at: std::time::Instant::now(),
             routing_generation: 0,
@@ -1054,7 +1139,7 @@ mod input_pipeline_tests {
             while received < rate {
                 let input_batch = rx.recv().await.unwrap();
                 assert_eq!(input_batch.events.len(), 1);
-                assert_event_matches_sequence(&input_batch.events[0], received);
+                assert_event_matches_sequence(&input_batch.events[0].event, received);
                 received += 1;
             }
             producer.join().unwrap();
@@ -1074,7 +1159,7 @@ mod input_pipeline_tests {
             tokio::time::sleep(stall).await;
             for sequence in 0..(INPUT_QUEUE_BATCHES * 2) {
                 let input_batch = rx.recv().await.unwrap();
-                assert_event_matches_sequence(&input_batch.events[0], sequence);
+                assert_event_matches_sequence(&input_batch.events[0].event, sequence);
             }
             producer.join().unwrap();
         }
@@ -1099,7 +1184,7 @@ mod input_pipeline_tests {
                 if sequence == 0 {
                     tokio::time::sleep(stall).await;
                 }
-                assert_event_matches_sequence(&input.events[0], sequence);
+                assert_event_matches_sequence(&input.events[0].event, sequence);
                 delivered.push((sequence, input.queued_at.elapsed()));
             }
             producer.join().unwrap();

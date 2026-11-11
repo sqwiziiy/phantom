@@ -48,6 +48,10 @@ physical keyboard/mouse
   TouchCommand stream
   (touch plus unused-key KeyDown/KeyUp)
           │
+          ▼
+  ordered Android output worker
+  bounded FIFO, synchronous mode barriers
+          │
           ├───────────────────────────────┐
           │                               │
           ▼                               ▼
@@ -103,6 +107,16 @@ instead of discarding key transitions; if the kernel buffer overflows, normal
 serializes reading, hotplug, grab changes, and state refreshes. Set
 `PHANTOM_INPUT_METRICS=1` for aggregate input, backend, relay, queue, and
 resynchronization measurements.
+
+All touch and Android key commands then pass through a second bounded FIFO
+queue owned by `phantom-android-output`. This worker performs backend I/O away
+from the daemon routing loop, preserves Down/Move/Up and Commit order, and
+accounts separately for output queue wait, event-to-send time, backend time,
+and Android Socket time. Capture and mode transitions enqueue a synchronous
+barrier on that same queue so their release/resync commands cannot overtake
+pending input. A full queue applies backpressure; commands are not dropped.
+If the Android backend reports an error, the worker attempts to release held
+Android keys and all active touches before continuing.
 
 Why it matters:
 

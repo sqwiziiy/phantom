@@ -159,9 +159,13 @@ Use:
 
 The detail flag exists because the raw evdev path is intentionally much noisier than normal trace logging.
 Input metrics are opt-in and report evdev read duration, evdev-to-route and
-queue-wait p50/p95/p99, bounded input queue depth, maximum epoll drain gap,
-backend and Android Socket write duration (including stalls over 200 ms),
-desktop relay write duration, process CPU percentage, and `SYN_DROPPED` counts.
+input/output queue-wait p50/p95/p99, bounded input and Android output queue
+depth, event-to-Android-send time, maximum epoll drain gap, backend and Android
+Socket write duration (including stalls over 200 ms), desktop relay write
+duration, process CPU percentage, and `SYN_DROPPED` counts. A dedicated Android
+output worker serializes touch and Android key commands away from the routing
+loop. A full output queue applies backpressure instead of dropping transitions;
+capture and mode-transition barriers preserve order with pending gameplay input.
 The daemon drains epoll on a
 dedicated reader thread and passes ordered batches through a bounded queue;
 when the queue fills, the reader applies backpressure rather than dropping

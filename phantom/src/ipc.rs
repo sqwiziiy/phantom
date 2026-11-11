@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader as StdBufReader, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -16,6 +18,7 @@ use crate::desktop_relay::DesktopKeyboardRelay;
 use crate::engine::{KeymapEngine, TouchCommand};
 use crate::error::{PhantomError, Result};
 use crate::input::{InputCapture, InputEvent, Key};
+use crate::input_metrics::InputMetrics;
 use crate::mouse_touch::MouseTouchEmulator;
 use crate::overlay::{CursorOverlay, OverlayPreview};
 use crate::profile::Profile;
@@ -225,7 +228,7 @@ impl PassthroughKeyState {
 pub struct DaemonState {
     pub engine: RwLock<KeymapEngine>,
     pub profile_path: RwLock<Option<PathBuf>>,
-    pub touch: Mutex<Box<dyn TouchDevice>>,
+    pub touch: Arc<Mutex<Box<dyn TouchDevice>>>,
     pub desktop_keyboard: Mutex<DesktopKeyboardRelay>,
     pub capture: Arc<Mutex<InputCapture>>,
     pub mouse_touch: Mutex<MouseTouchEmulator>,
@@ -238,6 +241,17 @@ pub struct DaemonState {
     pub capture_active: AtomicBool,
     pub routing_generation: AtomicU64,
     pub shutdown_tx: broadcast::Sender<()>,
+    touch_output: Mutex<Option<SyncSender<TouchOutputBatch>>>,
+    input_metrics: Mutex<Option<Arc<InputMetrics>>>,
+}
+
+const TOUCH_OUTPUT_QUEUE_BATCHES: usize = 128;
+
+struct TouchOutputBatch {
+    commands: Vec<TouchCommand>,
+    queued_at: Instant,
+    origin_at: Instant,
+    completion: Option<SyncSender<Result<()>>>,
 }
 
 impl DaemonState {
@@ -253,7 +267,7 @@ impl DaemonState {
         let state = Arc::new(Self {
             engine: RwLock::new(engine),
             profile_path: RwLock::new(None),
-            touch: Mutex::new(touch),
+            touch: Arc::new(Mutex::new(touch)),
             desktop_keyboard: Mutex::new(desktop_keyboard),
             capture: Arc::new(Mutex::new(capture)),
             mouse_touch: Mutex::new(MouseTouchEmulator::new(width, height)),
@@ -266,9 +280,188 @@ impl DaemonState {
             capture_active: AtomicBool::new(false),
             routing_generation: AtomicU64::new(0),
             shutdown_tx,
+            touch_output: Mutex::new(None),
+            input_metrics: Mutex::new(None),
         });
         (state, shutdown_rx)
     }
+}
+
+pub fn start_touch_output_worker(
+    state: &Arc<DaemonState>,
+    metrics: Arc<InputMetrics>,
+) -> Result<std::thread::JoinHandle<()>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(TOUCH_OUTPUT_QUEUE_BATCHES);
+    {
+        let mut output = state
+            .touch_output
+            .lock()
+            .map_err(|_| PhantomError::TouchBackend("touch output queue lock poisoned".into()))?;
+        if output.is_some() {
+            return Err(PhantomError::TouchBackend(
+                "touch output worker is already running".into(),
+            ));
+        }
+        *output = Some(sender);
+    }
+    *state
+        .input_metrics
+        .lock()
+        .map_err(|_| PhantomError::TouchBackend("input metrics lock poisoned".into()))? =
+        Some(metrics.clone());
+
+    let touch = state.touch.clone();
+    std::thread::Builder::new()
+        .name("phantom-android-output".into())
+        .spawn(move || run_touch_output_worker(receiver, touch, metrics))
+        .map_err(PhantomError::Io)
+}
+
+fn run_touch_output_worker(
+    receiver: Receiver<TouchOutputBatch>,
+    touch: Arc<Mutex<Box<dyn TouchDevice>>>,
+    metrics: Arc<InputMetrics>,
+) {
+    let mut held_android_keys = HashSet::new();
+    while let Ok(batch) = receiver.recv() {
+        metrics.record_output_queue_wait(batch.queued_at.elapsed(), batch.commands.len());
+        metrics.output_queue_remove(batch.commands.len());
+        metrics.record_evdev_to_send(batch.origin_at.elapsed());
+        let started = Instant::now();
+        let mut device = match touch.lock() {
+            Ok(device) => device,
+            Err(poisoned) => {
+                tracing::warn!("touch backend lock poisoned, recovering in output worker");
+                poisoned.into_inner()
+            }
+        };
+        let is_android_socket = device.backend_name() == "android_socket";
+        let result = device.apply_commands(&batch.commands);
+        let elapsed = started.elapsed();
+        metrics.record_backend(elapsed);
+        if is_android_socket {
+            metrics.record_android_socket(elapsed);
+        }
+        if result.is_err() {
+            let mut recovery_key_releases: HashSet<u16> = held_android_keys.clone();
+            for command in &batch.commands {
+                match command {
+                    TouchCommand::KeyDown { keycode, .. } => {
+                        recovery_key_releases.insert(*keycode);
+                    }
+                    TouchCommand::KeyUp { keycode } => {
+                        recovery_key_releases.insert(*keycode);
+                    }
+                    _ => {}
+                }
+            }
+            let key_ups: Vec<TouchCommand> = recovery_key_releases
+                .iter()
+                .map(|keycode| TouchCommand::KeyUp { keycode: *keycode })
+                .collect();
+            let recovery_started = Instant::now();
+            if !key_ups.is_empty() {
+                if let Err(recovery_err) = device.apply_commands(&key_ups) {
+                    tracing::error!(
+                        error = %recovery_err,
+                        "failed to release Android keys after output error"
+                    );
+                }
+            }
+            if let Err(recovery_err) = device.release_all() {
+                tracing::error!(
+                    error = %recovery_err,
+                    "failed to release active Android touches after output error"
+                );
+            }
+            let recovery_elapsed = recovery_started.elapsed();
+            metrics.record_backend(recovery_elapsed);
+            if is_android_socket {
+                metrics.record_android_socket(recovery_elapsed);
+            }
+            held_android_keys.clear();
+        } else {
+            for command in &batch.commands {
+                match command {
+                    TouchCommand::KeyDown { keycode, .. } => {
+                        held_android_keys.insert(*keycode);
+                    }
+                    TouchCommand::KeyUp { keycode } => {
+                        held_android_keys.remove(keycode);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(completion) = batch.completion {
+            let _ = completion.send(result);
+        } else if let Err(err) = result {
+            tracing::error!(error = %err, "asynchronous touch output failed");
+        }
+    }
+}
+
+pub fn queue_touch_commands(state: &Arc<DaemonState>, cmds: &[TouchCommand]) -> Result<()> {
+    queue_touch_commands_since(state, cmds, Instant::now())
+}
+
+pub fn queue_touch_commands_since(
+    state: &Arc<DaemonState>,
+    cmds: &[TouchCommand],
+    origin_at: Instant,
+) -> Result<()> {
+    if cmds.is_empty() {
+        return Ok(());
+    }
+    let sender = touch_output_sender(state)?;
+    let batch = TouchOutputBatch {
+        commands: cmds.to_vec(),
+        queued_at: Instant::now(),
+        origin_at,
+        completion: None,
+    };
+    let metrics_commands = batch.commands.len();
+    let metrics = state
+        .input_metrics
+        .lock()
+        .map_err(|_| PhantomError::TouchBackend("input metrics lock poisoned".into()))?
+        .clone();
+    if let Some(metrics) = &metrics {
+        metrics.output_queue_add(metrics_commands);
+    }
+    let result = sender.send(batch);
+    if result.is_err() {
+        if let Some(metrics) = metrics {
+            metrics.output_queue_remove(metrics_commands);
+        }
+    }
+    result.map_err(|_| PhantomError::TouchBackend("touch output worker stopped".into()))
+}
+
+pub fn stop_touch_output_worker(
+    state: &Arc<DaemonState>,
+    worker: std::thread::JoinHandle<()>,
+) -> Result<()> {
+    let sender = state
+        .touch_output
+        .lock()
+        .map_err(|_| PhantomError::TouchBackend("touch output queue lock poisoned".into()))?
+        .take();
+    drop(sender);
+    worker
+        .join()
+        .map_err(|_| PhantomError::TouchBackend("touch output worker did not stop cleanly".into()))
+}
+
+fn touch_output_sender(state: &Arc<DaemonState>) -> Result<SyncSender<TouchOutputBatch>> {
+    state
+        .touch_output
+        .lock()
+        .map_err(|_| PhantomError::TouchBackend("touch output queue lock poisoned".into()))?
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| PhantomError::TouchBackend("touch output worker is not running".into()))
 }
 
 const IPC_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -936,9 +1129,33 @@ pub fn apply_commands(state: &Arc<DaemonState>, cmds: &[TouchCommand]) -> Result
     if cmds.is_empty() {
         return Ok(());
     }
-
-    let mut device = lock_touch_device(state)?;
-    device.apply_commands(cmds)
+    let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+    let batch = TouchOutputBatch {
+        commands: cmds.to_vec(),
+        queued_at: Instant::now(),
+        origin_at: Instant::now(),
+        completion: Some(completion_tx),
+    };
+    let command_count = batch.commands.len();
+    let metrics = state
+        .input_metrics
+        .lock()
+        .map_err(|_| PhantomError::TouchBackend("input metrics lock poisoned".into()))?
+        .clone();
+    if let Some(metrics) = &metrics {
+        metrics.output_queue_add(command_count);
+    }
+    if touch_output_sender(state)?.send(batch).is_err() {
+        if let Some(metrics) = metrics {
+            metrics.output_queue_remove(command_count);
+        }
+        return Err(PhantomError::TouchBackend(
+            "touch output worker stopped".into(),
+        ));
+    }
+    completion_rx
+        .recv()
+        .map_err(|_| PhantomError::TouchBackend("touch output worker dropped completion".into()))?
 }
 
 fn current_grab_state(state: &Arc<DaemonState>) -> Result<(bool, bool)> {
@@ -1298,4 +1515,120 @@ async fn write_line_with_timeout<W: AsyncWrite + Unpin>(
         .await
         .map_err(|_| PhantomError::Ipc(format!("{} write timed out", label)))?
         .map_err(|e| PhantomError::Ipc(format!("{} write error: {}", label, e)))
+}
+
+#[cfg(test)]
+mod touch_output_tests {
+    use super::{run_touch_output_worker, TouchOutputBatch};
+    use crate::engine::TouchCommand;
+    use crate::error::Result;
+    use crate::input_metrics::InputMetrics;
+    use crate::touch::TouchDevice;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct DeliveryLog {
+        batches: Vec<(Vec<TouchCommand>, Instant, Instant)>,
+    }
+
+    struct DelayedSocketMock {
+        delay: Duration,
+        first: bool,
+        log: Arc<Mutex<DeliveryLog>>,
+    }
+
+    impl TouchDevice for DelayedSocketMock {
+        fn backend_name(&self) -> &'static str {
+            "android_socket"
+        }
+
+        fn apply_commands(&mut self, commands: &[TouchCommand]) -> Result<()> {
+            if self.first {
+                self.first = false;
+                std::thread::sleep(self.delay);
+            }
+            self.log.lock().unwrap().batches.push((
+                commands.to_vec(),
+                Instant::now(),
+                Instant::now(),
+            ));
+            Ok(())
+        }
+
+        fn release_all(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn interleaved_commands() -> Vec<TouchCommand> {
+        vec![
+            TouchCommand::TouchDown {
+                slot: 2,
+                x: 0.4,
+                y: 0.5,
+            },
+            TouchCommand::Commit,
+            TouchCommand::KeyDown {
+                keycode: 29,
+                repeat_count: 0,
+                meta_state: 0,
+            },
+            TouchCommand::TouchMove {
+                slot: 2,
+                x: 0.6,
+                y: 0.5,
+            },
+            TouchCommand::KeyUp { keycode: 29 },
+            TouchCommand::TouchUp { slot: 2 },
+        ]
+    }
+
+    #[test]
+    fn delayed_android_worker_delivers_down_move_up_and_keys_in_order() {
+        for delay in [100, 200, 500].map(Duration::from_millis) {
+            let log = Arc::new(Mutex::new(DeliveryLog::default()));
+            let device: Box<dyn TouchDevice> = Box::new(DelayedSocketMock {
+                delay,
+                first: true,
+                log: log.clone(),
+            });
+            let device = Arc::new(Mutex::new(device));
+            let (sender, receiver) = std::sync::mpsc::sync_channel(128);
+            let metrics = Arc::new(InputMetrics::from_environment());
+            let worker = std::thread::spawn(move || {
+                run_touch_output_worker(receiver, device, metrics);
+            });
+
+            let commands = interleaved_commands();
+            let batch_count = 24;
+            let mut origins = Vec::with_capacity(batch_count);
+            for _ in 0..batch_count {
+                let origin_at = Instant::now();
+                origins.push(origin_at);
+                sender
+                    .send(TouchOutputBatch {
+                        commands: commands.clone(),
+                        queued_at: origin_at,
+                        origin_at,
+                        completion: None,
+                    })
+                    .unwrap();
+            }
+            drop(sender);
+            worker.join().unwrap();
+
+            let log = log.lock().unwrap();
+            assert_eq!(log.batches.len(), batch_count);
+            for (batch, (delivered, _, _)) in log.batches.iter().enumerate() {
+                assert_eq!(delivered, &commands, "batch {batch} changed event order");
+            }
+            let first_delay = log.batches[0].1.duration_since(origins[0]);
+            let last_delay = log.batches[batch_count - 1]
+                .1
+                .duration_since(origins[batch_count - 1]);
+            assert!(first_delay >= delay);
+            assert!(last_delay < delay + Duration::from_millis(150));
+        }
+    }
 }

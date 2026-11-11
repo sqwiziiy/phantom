@@ -13,6 +13,12 @@ pub struct InputMetrics {
     route_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
     queue_wait_count: AtomicU64,
     queue_wait_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+    output_queue_wait_count: AtomicU64,
+    output_queue_wait_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+    output_queue_commands: AtomicUsize,
+    output_queue_high_water: AtomicUsize,
+    evdev_to_send_count: AtomicU64,
+    evdev_to_send_histogram: [AtomicU64; HISTOGRAM_BUCKETS],
     evdev_read_count: AtomicU64,
     evdev_read_total_us: AtomicU64,
     evdev_read_max_us: AtomicU64,
@@ -47,6 +53,12 @@ impl InputMetrics {
             route_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
             queue_wait_count: AtomicU64::new(0),
             queue_wait_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+            output_queue_wait_count: AtomicU64::new(0),
+            output_queue_wait_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+            output_queue_commands: AtomicUsize::new(0),
+            output_queue_high_water: AtomicUsize::new(0),
+            evdev_to_send_count: AtomicU64::new(0),
+            evdev_to_send_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
             evdev_read_count: AtomicU64::new(0),
             evdev_read_total_us: AtomicU64::new(0),
             evdev_read_max_us: AtomicU64::new(0),
@@ -105,6 +117,41 @@ impl InputMetrics {
                 .fetch_add(events as u64, Ordering::Relaxed);
             self.queue_wait_histogram[latency_bucket(latency.as_micros() as u64)]
                 .fetch_add(events as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_output_queue_wait(&self, latency: Duration, commands: usize) {
+        if self.enabled && commands > 0 {
+            self.output_queue_wait_count
+                .fetch_add(commands as u64, Ordering::Relaxed);
+            self.output_queue_wait_histogram[latency_bucket(latency.as_micros() as u64)]
+                .fetch_add(commands as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn output_queue_add(&self, commands: usize) {
+        if self.enabled {
+            let depth = self
+                .output_queue_commands
+                .fetch_add(commands, Ordering::Relaxed)
+                + commands;
+            self.output_queue_high_water
+                .fetch_max(depth, Ordering::Relaxed);
+        }
+    }
+
+    pub fn output_queue_remove(&self, commands: usize) {
+        if self.enabled {
+            self.output_queue_commands
+                .fetch_sub(commands, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_evdev_to_send(&self, latency: Duration) {
+        if self.enabled {
+            self.evdev_to_send_count.fetch_add(1, Ordering::Relaxed);
+            self.evdev_to_send_histogram[latency_bucket(latency.as_micros() as u64)]
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -203,6 +250,13 @@ impl InputMetrics {
         let queue_wait_count = self.queue_wait_count.swap(0, Ordering::Relaxed);
         let queue_wait_buckets: [u64; HISTOGRAM_BUCKETS] =
             std::array::from_fn(|idx| self.queue_wait_histogram[idx].swap(0, Ordering::Relaxed));
+        let output_queue_wait_count = self.output_queue_wait_count.swap(0, Ordering::Relaxed);
+        let output_queue_wait_buckets: [u64; HISTOGRAM_BUCKETS] = std::array::from_fn(|idx| {
+            self.output_queue_wait_histogram[idx].swap(0, Ordering::Relaxed)
+        });
+        let evdev_to_send_count = self.evdev_to_send_count.swap(0, Ordering::Relaxed);
+        let evdev_to_send_buckets: [u64; HISTOGRAM_BUCKETS] =
+            std::array::from_fn(|idx| self.evdev_to_send_histogram[idx].swap(0, Ordering::Relaxed));
         let evdev_read_calls = self.evdev_read_count.swap(0, Ordering::Relaxed);
         let evdev_read_total_us = self.evdev_read_total_us.swap(0, Ordering::Relaxed);
         let backend_calls = self.backend_count.swap(0, Ordering::Relaxed);
@@ -228,6 +282,23 @@ impl InputMetrics {
             queue_wait_p50_us = percentile(&queue_wait_buckets, queue_wait_count, 50),
             queue_wait_p95_us = percentile(&queue_wait_buckets, queue_wait_count, 95),
             queue_wait_p99_us = percentile(&queue_wait_buckets, queue_wait_count, 99),
+            output_queue_wait_commands = output_queue_wait_count,
+            output_queue_wait_p50_us =
+                percentile(&output_queue_wait_buckets, output_queue_wait_count, 50),
+            output_queue_wait_p95_us =
+                percentile(&output_queue_wait_buckets, output_queue_wait_count, 95),
+            output_queue_wait_p99_us =
+                percentile(&output_queue_wait_buckets, output_queue_wait_count, 99),
+            output_queue_depth_commands = self.output_queue_commands.load(Ordering::Relaxed),
+            output_queue_high_water_commands =
+                self.output_queue_high_water.swap(0, Ordering::Relaxed),
+            evdev_to_android_send_events = evdev_to_send_count,
+            evdev_to_android_send_p50_us =
+                percentile(&evdev_to_send_buckets, evdev_to_send_count, 50),
+            evdev_to_android_send_p95_us =
+                percentile(&evdev_to_send_buckets, evdev_to_send_count, 95),
+            evdev_to_android_send_p99_us =
+                percentile(&evdev_to_send_buckets, evdev_to_send_count, 99),
             evdev_read_calls,
             evdev_read_avg_us = average(evdev_read_total_us, evdev_read_calls),
             evdev_read_max_us = self.evdev_read_max_us.swap(0, Ordering::Relaxed),
