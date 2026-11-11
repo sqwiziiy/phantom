@@ -17,7 +17,7 @@
 - Regression test simulates 200/500 ms output stalls and records ordered final sink delivery latency for interleaved keyboard/mouse streams. This is a deterministic mock queue test, not a live Android Socket or KDE measurement.
 - Next action: run target-system acceptance and record physical before/after latency when KDE Wayland and Waydroid are available.
 - Physical KDE/Waydroid latency measurements are not available from this environment and must not be claimed.
-- Current follow-up: Stage A is committed as `3fc5b6a`. Stage B KWin geometry integration and mapping tests pass in the worktree; its separate commit is pending final review.
+- Current follow-up: Stages A and B are committed as `3fc5b6a` and `9ba9d07`. Automated checks pass. Physical KDE/Waydroid and Standoff 2 acceptance remains outstanding.
 
 ## Evidence log
 
@@ -79,4 +79,12 @@
 - Added coordinate transform tests for 2560x1440 output at 100%, 125%, and 150% scales, client offsets, bounds, resize behavior, and invalid geometry.
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, `cargo test --workspace --offline`, `cargo build --release --workspace --offline`, and `git diff --check` passed. Test totals: 116 library, 4 daemon pipeline, and 29 integration tests passed; 4 ignored.
 - No live KDE KWin/Waydroid run was available. The tests validate coordinate math and state updates; they do not prove the KWin runtime script loads correctly on the user's Plasma version or that Standoff 2 receives aligned touches. Target hardware acceptance is still required.
-- Next action: review and create the separate Stage B commit, preserving the Stage A commit `3fc5b6a` and the user's untracked task/matrix files.
+- Commit created: `9ba9d07` (`feat: map menu touch coordinates through KDE Wayland`). The user's untracked `CODEX_TASK_RU.md` and `TEST_MATRIX.md` remain untouched.
+- Next action: on the target Arch/KDE Wayland/Waydroid system, confirm the temporary KWin script loads and unloads, check diagnostic pairs against known window/client points at 125% scale, then validate live Standoff 2 behavior with capture toggles, held WASD, mouse flicks, and mixed input. Record actual latency values before claiming target acceptance.
+
+### 2026-11-11 — Stage B commit and worktree check
+
+- Created separate Stage B commit `9ba9d07`, following Stage A commit `3fc5b6a`.
+- Final automated validation remained green: `cargo fmt --all`; `cargo clippy --workspace --all-targets --offline -- -D warnings`; `cargo test --workspace --offline` (116 library, 4 daemon, 29 integration passed; 4 ignored); `cargo build --release --workspace --offline`; and `git diff --check`.
+- Git worktree is clean except the two user-provided untracked files `CODEX_TASK_RU.md` and `TEST_MATRIX.md`.
+- No physical live test or measured live touch/typing latency was performed in this environment.
