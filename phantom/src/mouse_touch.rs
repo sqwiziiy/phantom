@@ -53,11 +53,11 @@ enum ScrollDirection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct HostFrame {
-    pub(crate) left: f64,
-    pub(crate) top: f64,
-    pub(crate) width: f64,
-    pub(crate) height: f64,
+pub struct HostFrame {
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +149,9 @@ impl MouseTouchEmulator {
     }
 
     pub fn seed_from_host_cursor(&mut self) {
+        if self.last_seed_source == Some("kwin") {
+            return;
+        }
         if let Some((seed, source)) = self.seed_position() {
             self.cursor_x = seed.x;
             self.cursor_y = seed.y;
@@ -189,6 +192,40 @@ impl MouseTouchEmulator {
 
     pub fn overlay_frame(&self) -> Option<crate::overlay::OverlayFrame> {
         self.host_frame.map(Into::into)
+    }
+
+    pub fn apply_kde_snapshot(
+        &mut self,
+        snapshot: &crate::kde_wayland::KdeWindowSnapshot,
+        follow_pointer: bool,
+    ) -> bool {
+        if !snapshot.is_waydroid() || snapshot.frame.width <= 0.0 || snapshot.frame.height <= 0.0 {
+            return false;
+        }
+        let changed = self.host_frame != Some(snapshot.frame);
+        self.host_frame = Some(snapshot.frame);
+        self.last_seed_source = Some("kwin");
+        if follow_pointer {
+            self.cursor_x =
+                ((snapshot.cursor_x - snapshot.frame.left) / snapshot.frame.width).clamp(0.0, 1.0);
+            self.cursor_y =
+                ((snapshot.cursor_y - snapshot.frame.top) / snapshot.frame.height).clamp(0.0, 1.0);
+        }
+        changed
+    }
+
+    pub fn coordinate_diagnostic(&self) -> Option<(f64, f64, u32, u32)> {
+        let frame = self.host_frame?;
+        let host_x = frame.left + self.cursor_x * frame.width;
+        let host_y = frame.top + self.cursor_y * frame.height;
+        let (android_x, android_y) = crate::kde_wayland::logical_to_android_pixel(
+            frame,
+            host_x,
+            host_y,
+            self.screen_width,
+            self.screen_height,
+        )?;
+        Some((host_x, host_y, android_x, android_y))
     }
 
     pub fn suspend(&mut self) -> Vec<TouchCommand> {
@@ -504,6 +541,48 @@ mod tests {
         assert!(state.visible);
         assert_eq!(state.screen_x, 175.0);
         assert_eq!(state.screen_y, 400.0);
+    }
+
+    #[test]
+    fn kde_snapshot_seeds_logical_cursor_and_tracks_client_resize() {
+        let mut emulator = MouseTouchEmulator::new_virtual(2560, 1440);
+        let snapshot = crate::kde_wayland::KdeWindowSnapshot {
+            resource_class: "waydroid".into(),
+            caption: "Standoff 2".into(),
+            frame: HostFrame {
+                left: 200.0,
+                top: 100.0,
+                width: 2048.0,
+                height: 1152.0,
+            },
+            cursor_x: 1224.0,
+            cursor_y: 676.0,
+            output_scale: 1.25,
+        };
+
+        assert!(emulator.apply_kde_snapshot(&snapshot, true));
+        assert_eq!(emulator.cursor_x, 0.5);
+        assert_eq!(emulator.cursor_y, 0.5);
+        assert_eq!(
+            emulator.coordinate_diagnostic(),
+            Some((1224.0, 676.0, 1280, 720))
+        );
+
+        let resized = crate::kde_wayland::KdeWindowSnapshot {
+            frame: HostFrame {
+                width: 1600.0,
+                height: 900.0,
+                ..snapshot.frame
+            },
+            ..snapshot
+        };
+        assert!(emulator.apply_kde_snapshot(&resized, false));
+        assert_eq!(emulator.cursor_x, 0.5);
+        assert_eq!(emulator.cursor_y, 0.5);
+        assert_eq!(
+            emulator.coordinate_diagnostic(),
+            Some((1000.0, 550.0, 1280, 720))
+        );
     }
 
     #[test]

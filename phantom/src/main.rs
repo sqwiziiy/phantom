@@ -11,6 +11,7 @@ use phantom::error::{PhantomError, Result};
 use phantom::input::{InputCapture, InputEvent, RawInputEvent};
 use phantom::input_metrics::InputMetrics;
 use phantom::ipc::{self, DaemonState, IpcRequest, MouseMode};
+use phantom::kde_wayland::KdeWaylandClient;
 use phantom::logging::trace_detail_enabled;
 use phantom::profile::Profile;
 use phantom::touch;
@@ -373,6 +374,15 @@ async fn run_daemon() -> Result<()> {
         DaemonState::new(engine, touch, desktop_keyboard, capture, screen_w, screen_h);
     let input_metrics = Arc::new(InputMetrics::from_environment());
     let touch_output_worker = ipc::start_touch_output_worker(&state, input_metrics.clone())?;
+    let kde_coordinates = match KdeWaylandClient::start().await {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(error = %err, "KWin coordinate tracking could not start");
+            None
+        }
+    };
+    let mut kde_snapshot_rx = kde_coordinates.as_ref().map(KdeWaylandClient::receiver);
+    let coordinate_diagnostics = std::env::var_os("PHANTOM_COORDINATE_DIAGNOSTICS").is_some();
     if input_metrics.enabled() {
         tracing::info!("input metrics enabled by PHANTOM_INPUT_METRICS");
     }
@@ -549,6 +559,29 @@ async fn run_daemon() -> Result<()> {
                 tracing::info!("IPC shutdown command received");
                 break;
             }
+            _ = async {
+                if let Some(receiver) = kde_snapshot_rx.as_mut() {
+                    let _ = receiver.changed().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                if let Some(snapshot) = kde_snapshot_rx.as_ref().and_then(|rx| rx.borrow().clone()) {
+                    let follow_pointer = !state.capture_active.load(Ordering::Acquire);
+                    let frame_changed = match ipc::lock_mouse_touch(&state) {
+                        Ok(mut mouse_touch) => mouse_touch.apply_kde_snapshot(&snapshot, follow_pointer),
+                        Err(err) => {
+                            tracing::warn!(error = %err, "KWin coordinate update failed");
+                            false
+                        }
+                    };
+                    if frame_changed && state.capture_active.load(Ordering::Acquire)
+                        && matches!(ipc::current_mouse_mode(&state), Ok(MouseMode::MenuTouch))
+                    {
+                        let _ = ipc::sync_cursor_overlay(&state, true);
+                    }
+                }
+            }
             input_batch = input_rx.recv() => {
                 let Some(input_batch) = input_batch else {
                     tracing::error!("input reader channel closed unexpectedly");
@@ -634,6 +667,27 @@ async fn run_daemon() -> Result<()> {
                                         timed_event.event_at,
                                     ) {
                                         tracing::warn!("mouse-touch inject error: {}", e);
+                                    }
+                                    if coordinate_diagnostics && !mouse_touch_cmds.is_empty() {
+                                        let output_scale = kde_snapshot_rx
+                                            .as_ref()
+                                            .and_then(|rx| rx.borrow().clone())
+                                            .map(|snapshot| snapshot.output_scale)
+                                            .unwrap_or(1.0);
+                                        if let Ok(mouse_touch) = ipc::lock_mouse_touch(&state) {
+                                            if let Some((host_x, host_y, android_x, android_y)) =
+                                                mouse_touch.coordinate_diagnostic()
+                                            {
+                                                tracing::info!(
+                                                    host_logical_x = host_x,
+                                                    host_logical_y = host_y,
+                                                    android_pixel_x = android_x,
+                                                    android_pixel_y = android_y,
+                                                    output_scale,
+                                                    "touch coordinate diagnostic"
+                                                );
+                                            }
+                                        }
                                     }
                                     if trace_detail_enabled() && !mouse_touch_cmds.is_empty() {
                                         tracing::trace!(
@@ -795,6 +849,9 @@ async fn run_daemon() -> Result<()> {
 
     if let Err(err) = ipc::stop_touch_output_worker(&state, touch_output_worker) {
         tracing::warn!("touch output worker shutdown failed: {}", err);
+    }
+    if let Some(kde_coordinates) = kde_coordinates {
+        kde_coordinates.stop();
     }
 
     {

@@ -9,6 +9,7 @@ pub mod inject;
 pub mod input;
 pub mod input_metrics;
 pub mod ipc;
+pub mod kde_wayland;
 pub mod logging;
 pub mod mouse_touch;
 pub mod overlay;

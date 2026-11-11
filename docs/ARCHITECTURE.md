@@ -174,6 +174,7 @@ Important runtime boundary:
 - capture transitions now also flush the desktop keyboard relay and rebuild hold-style keyboard state from the real currently pressed keys so Phantom does not carry stale key ownership across mode changes
 - a separate lightweight cursor overlay visualizes the owned menu-touch cursor while that mode is active
 - on Wayland compositors, that cursor overlay uses a layer-shell surface with an empty input region so Phantom does not steal mouse input back from Waydroid
+- on KDE Wayland, a temporary KWin script publishes the active Waydroid client geometry, cursor position, and output device-pixel ratio over the session bus; the owned cursor is seeded in KWin logical coordinates and mapped proportionally through the client area to Android pixels
 - touchpad tap gestures are synthesized inside Phantom while menu-touch owns the mouse, because the desktop is no longer responsible for translating them
 
 This is what makes the GUI and CLI first-class runtime controls instead of file-only tools.

@@ -178,6 +178,18 @@ uinput relay. The configured hotkey key itself is also visible to KDE in this
 mode. Capture transitions grab or release keyboard devices, including combined
 keyboard/mouse devices, and reconcile held keys at the boundary.
 
+On KDE Wayland, Phantom looks for `qdbus6`, `qdbus-qt6`, `qdbus`, or
+`qdbus-qt5` and loads a temporary KWin script for the daemon lifetime. It reads
+the active Waydroid window's KWin `clientGeometry`, logical cursor position,
+and output device-pixel ratio. It does not write KWin settings or install a
+persistent script. The logical cursor point is made relative to the client
+rectangle and scaled to the configured Android pixel dimensions; this accounts
+for window borders, fullscreen geometry, and resize without multiplying by the
+KDE scale a second time. Set `PHANTOM_COORDINATE_DIAGNOSTICS=1` to log paired
+KWin logical cursor and projected Android pixel coordinates while menu-touch
+is active. If KWin scripting or the session D-Bus endpoint is unavailable,
+Phantom retains the existing compositor fallback.
+
 ## Aim Operations
 
 `aim` has three modes.

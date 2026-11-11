@@ -17,7 +17,7 @@
 - Regression test simulates 200/500 ms output stalls and records ordered final sink delivery latency for interleaved keyboard/mouse streams. This is a deterministic mock queue test, not a live Android Socket or KDE measurement.
 - Next action: run target-system acceptance and record physical before/after latency when KDE Wayland and Waydroid are available.
 - Physical KDE/Waydroid latency measurements are not available from this environment and must not be claimed.
-- Current follow-up: Stage A Android output decoupling is implemented in the worktree and passed the first offline clippy/test run. Stage B KDE KWin geometry integration and its commit are still pending.
+- Current follow-up: Stage A is committed as `3fc5b6a`. Stage B KWin geometry integration and mapping tests pass in the worktree; its separate commit is pending final review.
 
 ## Evidence log
 
@@ -69,3 +69,14 @@
 - Added deterministic worker delivery tests for 100/200/500 ms backend delays with interleaved touch and keyboard commands, and daemon pipeline tests for 200/500 ms stalls and bounded queue backpressure. Assertions observe final mock sink delivery and exact command order, not only reader speed.
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, and `cargo test --workspace --offline` passed. Counts: 113 library tests, 4 daemon tests, 29 integration tests passed; 4 ignored.
 - Physical F8/F1/WASD/mouse acceptance and live Android Socket latency are not measured here. The tests use deterministic mock backends. Stage A still requires release build and final checks before commit.
+
+### 2026-11-11 — KDE Wayland coordinate mapping (Stage B)
+
+- Added a temporary KWin script loaded through the KWin scripting D-Bus API. It publishes active-window `clientGeometry`, cursor position, and output `devicePixelRatio` to a short-lived Phantom session-bus service. Phantom unloads the script at daemon shutdown and does not write persistent KWin settings.
+- Mapped KWin logical coordinates relative to the Waydroid client area into the configured Android physical pixel dimensions. The transform handles client-window offsets, resize, and fullscreen through live geometry updates; it does not multiply the normalized location by KDE scale twice.
+- The owned menu-touch cursor follows KWin's logical pointer before capture and retains its position while capture owns the mouse. KWin snapshots update the client frame during capture. Existing non-KDE cursor backends remain the fallback.
+- Added `PHANTOM_COORDINATE_DIAGNOSTICS=1`, logging the host logical cursor coordinate, projected Android pixel coordinate, and reported output scale for menu-touch commands.
+- Added coordinate transform tests for 2560x1440 output at 100%, 125%, and 150% scales, client offsets, bounds, resize behavior, and invalid geometry.
+- `cargo fmt --all`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, `cargo test --workspace --offline`, `cargo build --release --workspace --offline`, and `git diff --check` passed. Test totals: 116 library, 4 daemon pipeline, and 29 integration tests passed; 4 ignored.
+- No live KDE KWin/Waydroid run was available. The tests validate coordinate math and state updates; they do not prove the KWin runtime script loads correctly on the user's Plasma version or that Standoff 2 receives aligned touches. Target hardware acceptance is still required.
+- Next action: review and create the separate Stage B commit, preserving the Stage A commit `3fc5b6a` and the user's untracked task/matrix files.
