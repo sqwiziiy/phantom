@@ -68,6 +68,7 @@
 - Added physical evdev timestamp-to-send, output queue wait/depth/high-water, backend duration, and Android Socket duration measurements. Updated architecture and operations documentation.
 - Added deterministic worker delivery tests for 100/200/500 ms backend delays with interleaved touch and keyboard commands, and daemon pipeline tests for 200/500 ms stalls and bounded queue backpressure. Assertions observe final mock sink delivery and exact command order, not only reader speed.
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, and `cargo test --workspace --offline` passed. Counts: 113 library tests, 4 daemon tests, 29 integration tests passed; 4 ignored.
+- An initial clippy pass flagged one unnecessary borrow in timestamp routing; corrected it before the passing verification run.
 - Physical F8/F1/WASD/mouse acceptance and live Android Socket latency are not measured here. The tests use deterministic mock backends. Stage A still requires release build and final checks before commit.
 
 ### 2026-11-11 — KDE Wayland coordinate mapping (Stage B)
@@ -78,6 +79,7 @@
 - Added `PHANTOM_COORDINATE_DIAGNOSTICS=1`, logging the host logical cursor coordinate, projected Android pixel coordinate, and reported output scale for menu-touch commands.
 - Added coordinate transform tests for 2560x1440 output at 100%, 125%, and 150% scales, client offsets, bounds, resize behavior, and invalid geometry.
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets --offline -- -D warnings`, `cargo test --workspace --offline`, `cargo build --release --workspace --offline`, and `git diff --check` passed. Test totals: 116 library, 4 daemon pipeline, and 29 integration tests passed; 4 ignored.
+- The first Stage B clippy attempt found an unused D-Bus interface constant; removed it before the passing full verification run.
 - No live KDE KWin/Waydroid run was available. The tests validate coordinate math and state updates; they do not prove the KWin runtime script loads correctly on the user's Plasma version or that Standoff 2 receives aligned touches. Target hardware acceptance is still required.
 - Commit created: `9ba9d07` (`feat: map menu touch coordinates through KDE Wayland`). The user's untracked `CODEX_TASK_RU.md` and `TEST_MATRIX.md` remain untouched.
 - Next action: on the target Arch/KDE Wayland/Waydroid system, confirm the temporary KWin script loads and unloads, check diagnostic pairs against known window/client points at 125% scale, then validate live Standoff 2 behavior with capture toggles, held WASD, mouse flicks, and mixed input. Record actual latency values before claiming target acceptance.
